@@ -174,6 +174,7 @@ final class Recorder {
         chunks = []
         callbacks = 0; convertErrors = 0; restarts = 0
         noiseFloor = 0.002; heardSpeech_ = false; lastVoiceAt = .distantPast; startedAt = Date()
+        lastBufferAt = Date()
         lock.unlock()
         isReady = false
 
@@ -229,12 +230,21 @@ final class Recorder {
         installTapAndStart(engine)
     }
 
+    /// 停掉的引擎先留 3 秒再释放: 系统的 IO 属性回调可能还在队列里, 立刻释放会访问野指针崩溃
+    /// (2026-11-06 录音中看门狗重建引擎时崩过一次, 栈在 AVAudioIOUnit::IOUnitPropertyListener)
+    private var retired: [AVAudioEngine] = []
+
     private func teardownEngine() {
         if let observer { NotificationCenter.default.removeObserver(observer) }
         observer = nil
-        engine?.inputNode.removeTap(onBus: 0)
-        engine?.stop()
+        guard let old = engine else { return }
         engine = nil
+        old.inputNode.removeTap(onBus: 0)
+        old.stop()
+        retired.append(old)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            self?.retired.removeAll { $0 === old }
+        }
     }
 
     private func installTapAndStart(_ engine: AVAudioEngine, retry: Int = 0) {

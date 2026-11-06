@@ -4,8 +4,9 @@
 //
 // 两种麦克风:
 //   Mac 内置麦 (默认): AirPods 只当遥控器, 一直是普通媒体键, 按柄开始/结束都可用
-//   AirPods 麦       : 开麦后 AirPods 切通话模式, 按柄变成系统 "静音手势" 不交给我们,
-//                      所以靠 "停顿 2.5 秒自动结束" 兜底; 提示音只能在开麦前播
+//   AirPods 麦       : 开麦后 AirPods 切通话模式, 按柄变成系统 "静音手势", macOS 27 不交给我们.
+//                      改为监听 bluetoothd 的系统日志来发现按柄 (StemLog.swift);
+//                      "停顿 2.5 秒自动结束" 作兜底; 提示音只能在开麦前播
 
 import AppKit
 import AVFoundation
@@ -30,6 +31,12 @@ final class AppController: NSObject, NSApplicationDelegate {
     private let playback = MPNowPlayingInfoCenter.default()
     private var lastSingleAt = Date.distantPast
     private var muteRegistered = false
+    private let stemLog = StemLogWatcher()
+    /// 上次录音结束的时间: 结束后 AirPods 还会在通话模式停留几秒, 这时的按柄也走系统日志
+    private var lastStopAt = Date.distantPast
+    /// 单段录音上限: 忘了结束 (或者按柄检测失效) 时不会一直录下去
+    private let maxRecordingSeconds: Double = 300
+    private var maxLengthTimer: Timer?
 
     // MARK: 设置 (UserDefaults)
 
@@ -41,9 +48,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         get { EngineChoice(rawValue: UserDefaults.standard.string(forKey: "engine") ?? "") ?? .whisper }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: "engine"); applySettings() }
     }
-    /// 停顿自动结束: 只在 AirPods 麦模式生效 (Mac 麦模式按柄能结束, 不需要)
+    /// 停顿自动结束: 只在 AirPods 麦模式可选, 默认关. 按柄已经能结束; 自动结束没有提示音
+    /// (通话模式下 App 的声音听不到), 还会在想事情停顿时把话打断
     private var autoStop: Bool {
-        get { UserDefaults.standard.object(forKey: "autoStop") as? Bool ?? true }
+        get { UserDefaults.standard.object(forKey: "autoStop") as? Bool ?? false }
         set { UserDefaults.standard.set(newValue, forKey: "autoStop"); applySettings() }
     }
 
@@ -64,6 +72,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             guard self?.mic == .airpods else { return }
             self?.registerMuteGestureOnce()
         }
+        stemLog.onPress = { [weak self] in self?.stemPressFromLog() }
         recorder.onSilence = { [weak self] in
             guard self?.state == .recording else { return }
             self?.stopRecording()
@@ -77,12 +86,14 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ n: Notification) {
+        stemLog.stop()
         whisper.stop()
     }
 
     private func applySettings() {
         recorder.source = mic
         recorder.silenceTimeout = (mic == .airpods && autoStop) ? 2.5 : nil
+        if mic == .airpods { stemLog.start() } else { stemLog.stop() }
         guard statusItem != nil else { return }
         for (k, item) in micItems { item.state = k == mic ? .on : .off }
         for (k, item) in engineItems { item.state = k == engine ? .on : .off }
@@ -106,8 +117,8 @@ final class AppController: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
         menu.addItem(header("麦克风"))
-        micItems[.mac] = item("Mac 内置麦 (按柄可结束)", #selector(pickMacMic))
-        micItems[.airpods] = item("AirPods 麦 (按柄结束不可用)", #selector(pickAirPodsMic))
+        micItems[.mac] = item("Mac 内置麦 (音质好, 要在 Mac 旁边)", #selector(pickMacMic))
+        micItems[.airpods] = item("AirPods 麦 (可以离开 Mac 走动着说)", #selector(pickAirPodsMic))
         micItems.values.sorted { $0.title < $1.title }.forEach(menu.addItem)
         autoStopItem = item("    停顿 2.5 秒自动结束", #selector(toggleAutoStop))
         menu.addItem(autoStopItem)
@@ -142,14 +153,15 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     private func refreshIcon() {
+        let preparing = state == .recording && !recorder.isReady
         let (symbol, tint): (String, NSColor?) = switch state {
         case .idle: ("mic", nil)
-        case .recording: ("mic.fill", .systemRed)
+        case .recording: ("mic.fill", preparing ? .systemYellow : .systemRed)
         case .transcribing: ("waveform", .systemOrange)
         }
         statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: state.rawValue)
         statusItem.button?.contentTintColor = tint
-        stateMenuItem.title = "状态: \(state.rawValue)"
+        stateMenuItem.title = "状态: \(preparing ? "准备中 (等麦克风打开)" : state.rawValue)"
     }
 
     @objc private func menuToggle() { singlePress(source: "菜单") }
@@ -208,27 +220,60 @@ final class AppController: NSObject, NSApplicationDelegate {
             }
         }
         // AirPods 单捏发的是 play / pause 交替, 都当成单捏
-        on(cc.togglePlayPauseCommand, "togglePlayPause") { self.singlePress(source: "单捏") }
-        on(cc.playCommand, "play") { self.playback.playbackState = .playing; self.singlePress(source: "单捏") }
-        on(cc.pauseCommand, "pause") { self.playback.playbackState = .paused; self.singlePress(source: "单捏") }
+        on(cc.togglePlayPauseCommand, "togglePlayPause") { self.remoteSingle() }
+        on(cc.playCommand, "play") { self.playback.playbackState = .playing; self.remoteSingle() }
+        on(cc.pauseCommand, "pause") { self.playback.playbackState = .paused; self.remoteSingle() }
         on(cc.nextTrackCommand, "nextTrack") { self.doublePress(source: "双捏") }
         on(cc.previousTrackCommand, "previousTrack") { log("三捏: 暂未绑定") }
     }
 
-    /// 仅 AirPods 麦模式: 系统偶尔会把录音中的单捏交给我们
+    /// 媒体键的单捏. 摘下耳机 / 耳机断开时系统也会发一个 "暂停", 和单捏一模一样;
+    /// 能区分的线索是此时输出已经不在蓝牙耳机上了, 所以空闲时遇到这种情况不开始录音.
+    /// (录音中照常结束: 耳机都摘了, 结束并转写是合理的)
+    private func remoteSingle() {
+        if state == .idle && !defaultOutputIsBluetooth() {
+            log("单捏 忽略: 输出不在蓝牙耳机上, 多半是摘下耳机或断开")
+            return
+        }
+        singlePress(source: "单捏")
+    }
+
+    /// AirPods 麦模式下按柄 (通话模式的 "静音" 命令), 来自 bluetoothd 系统日志
+    private func stemPressFromLog() {
+        switch state {
+        case .recording:
+            singlePress(source: "按柄(系统日志)")
+        case .idle where Date().timeIntervalSince(lastStopAt) < 10:
+            // 刚录完, AirPods 还停在通话模式, 这时按柄也当单捏 (开始下一段)
+            singlePress(source: "按柄(系统日志, 录完不久)")
+        default:
+            // 别的 App (会议等) 在用 AirPods 麦时的按柄, 不归我们
+            log("按柄(系统日志) 忽略, 当前: \(state.rawValue)")
+        }
+    }
+
+    /// 官方静音手势 API. macOS 27 上系统基本都会拒绝交给我们, 按柄改由系统日志检测.
+    /// 这里只记录, 不触发动作: 开麦时系统也会同步调用一次 (取消静音), 当成按柄会误结束.
+    /// 返回 true 是为了万一系统接受了, 能少弹一次 "Cannot Control Mic".
     private func registerMuteGestureOnce() {
         guard !muteRegistered else { return }
         muteRegistered = true
         do {
-            try AVAudioApplication.shared.setInputMuteStateChangeHandler { [weak self] muted in
-                DispatchQueue.main.async {
-                    guard let self, self.state == .recording, self.recorder.isReady else {
-                        log("静音手势(\(muted ? "静音" : "取消静音")) 忽略")
-                        return
+            try AVAudioApplication.shared.setInputMuteStateChangeHandler { muted in
+                log("官方静音手势回调: \(muted ? "静音" : "取消静音") (只记录)")
+                if muted {
+                    // 系统接受时会记一个静音状态, 每按一次切一次, 提示音和横幅也跟着交替 (听着像开了又关).
+                    // 每次被切成静音就改回来, 让每次按柄听到的系统提示音都一样.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        do { try AVAudioApplication.shared.setInputMuted(false); log("官方静音状态: 已复位为取消静音") }
+                        catch { log("官方静音状态复位失败: \(error)") }
                     }
-                    self.singlePress(source: "录音中静音手势")
                 }
                 return true
+            }
+            NotificationCenter.default.addObserver(forName: AVAudioApplication.inputMuteStateChangeNotification,
+                                                   object: nil, queue: .main) { n in
+                log("官方静音状态通知: \(n.userInfo ?? [:])")
             }
         } catch {
             log("注册静音手势失败: \(error)")
@@ -269,16 +314,19 @@ final class AppController: NSObject, NSApplicationDelegate {
         recorder.onReady = { [weak self] in
             guard let self, self.state == .recording else { return }
             log("录音就绪, 可以说话了")
-            if !airpods { self.keeper.cue(.ready) }  // Mac 麦: 麦克风开好再响
+            self.refreshIcon()  // 图标从 "准备中" (黄) 变成 "录音中" (红)
+            // Mac 麦: 麦克风开好再响. AirPods 麦不响: 通话模式下 App 放的声音听不到 (2026-11-06 实测),
+            // 开麦前响又经常被蓝牙切换截掉; 看菜单栏图标变红 (或等 2 到 3 秒) 再说话
+            if !airpods { self.keeper.cue(.ready) }
         }
         state = .recording
-        if airpods {
-            // AirPods 麦: 一开麦蓝牙切通话模式, 之后的声音听不见, 只能先响再开麦
-            keeper.cue(.ready)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.beginRecorder() }
-        } else {
-            beginRecorder()
+        maxLengthTimer?.invalidate()
+        maxLengthTimer = Timer.scheduledTimer(withTimeInterval: maxRecordingSeconds, repeats: false) { [weak self] _ in
+            guard let self, self.state == .recording else { return }
+            log(String(format: "录音满 %.0f 分钟, 自动结束", self.maxRecordingSeconds / 60))
+            self.stopRecording()
         }
+        beginRecorder()
     }
 
     private func beginRecorder() {
@@ -296,6 +344,9 @@ final class AppController: NSObject, NSApplicationDelegate {
     private func stopRecording() {
         let heard = recorder.heardSpeech
         let result = recorder.stop()
+        maxLengthTimer?.invalidate()
+        maxLengthTimer = nil
+        lastStopAt = Date()
         keeper.claim()
         guard let (url, seconds) = result else { state = .idle; return }
         log(String(format: "录音结束, %.1f 秒", seconds))
